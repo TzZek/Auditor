@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-main.py
+main.py (first‐segment padding only)
 
-1) Downloads the CIS Microsoft Windows Server 2022 v3.0.0 L1 Member Server .audit file
-   from Tenable (using the provided API URL).
-2) Reads it as plain text and extracts each <custom_item> … </custom_item> block.
+1) Downloads the CIS Microsoft Windows Server 2022 .audit file.
+2) Extracts each <custom_item> … </custom_item> block.
 3) For each block, parses out:
-     - Section        (first segment zero-padded if <10)
+     - Section            (only first segment zero‐padded to 2 digits)
      - Level
      - Name
-     - Description    (all text in the `info : "…"` field, multiline)
-     - Remediation Procedure (all text in the `solution : "…"` field, multiline)
-     - NIST           (all `800-53|…` entries from `reference : "…"` field)
-4) Writes results into:
+     - Description        (full multiline info)
+     - Remediation Procedure (full multiline solution)
+     - NIST               (every 800‐53* reference, each on its own line)
+4) Writes:
      • cis_win2022_from_audit.csv
      • cis_win2022_from_audit.xlsx
 """
@@ -23,7 +22,7 @@ import re
 import sys
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) CONFIGURATION: URL & FILENAMES
+# 1) CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 AUDIT_URL = (
@@ -40,9 +39,8 @@ HEADERS = {
                   "Chrome/100.0.4896.75 Safari/537.36"
 }
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 2) STEP 1: DOWNLOAD THE .audit FILE (RAW TEXT)
+# 2) DOWNLOAD THE .audit FILE
 # ─────────────────────────────────────────────────────────────────────────────
 
 print(f"1) Downloading .audit file from:\n   {AUDIT_URL}")
@@ -58,20 +56,17 @@ with open(LOCAL_AUDIT_FILE, "wb") as f:
 
 print(f"   ✔ Saved to: {LOCAL_AUDIT_FILE}\n")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 3) STEP 2: READ THE FILE AS TEXT AND EXTRACT <custom_item> BLOCKS
+# 3) EXTRACT <custom_item> BLOCKS FROM RAW TEXT
 # ─────────────────────────────────────────────────────────────────────────────
 
 print("2) Extracting <custom_item> blocks…")
-
 try:
     raw_text = open(LOCAL_AUDIT_FILE, "r", encoding="utf-8", errors="replace").read()
 except Exception as e:
     print(f"ERROR: Could not read {LOCAL_AUDIT_FILE}:\n  {e}")
     sys.exit(1)
 
-# Use a regex with DOTALL to find everything between <custom_item> and </custom_item>
 pattern = re.compile(r"<custom_item>(.*?)</custom_item>", re.DOTALL)
 matches = pattern.findall(raw_text)
 
@@ -81,66 +76,65 @@ if not matches:
 
 print(f"   • Found {len(matches)} <custom_item> blocks.\n")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) UTILITY FUNCTIONS TO PARSE ONE <custom_item> BLOCK INTO FIELDS
+# 4) HELPERS TO PARSE ONE <custom_item> BLOCK
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_description_field(desc_field: str):
     """
-    Given a string like:
-      1.1.7 (L1) Ensure 'Store passwords using reversible encryption' is set to 'Disabled'
-    Return:
-      - section = "01.1.7"   (zero‐padded if the first segment <10)
-      - level   = "1"
-      - name    = "Ensure 'Store passwords using reversible encryption' is set to 'Disabled'"
+    Input example:
+      1.1.7 (L1) Ensure '…'
+    Pad only the first segment:
+      '1.1.7' → '01.1.7'
+      '9.9.9' → '09.9.9'
+      '1.12.3'→ '01.12.3'
+      '10.2.4'→ '10.2.4' (no change)
     """
-    m = re.match(r"^\s*([\d\.]+)\s*\(L(\d+)\)\s*(.+)$", desc_field.strip())
+    desc_field = desc_field.strip().strip('"')
+    m = re.match(r"^(\d+)(\.\d+(?:\.\d+)*)\s*\(L(\d+)\)\s*(.+)$", desc_field)
     if not m:
-        return "", "", desc_field.strip().strip('"')
+        # fallback if regex fails
+        return "", "", desc_field
 
-    section_raw = m.group(1).strip()  # e.g. "1.1.7"
-    level = m.group(2).strip()        # e.g. "1"
-    name = m.group(3).strip().strip('"')
+    first_seg     = m.group(1)         # e.g. "1" or "9" or "10"
+    rest_segments = m.group(2)         # e.g. ".1.7" or ".12.3" or ".2.4"
+    level         = m.group(3).strip() # e.g. "1"
+    name          = m.group(4).strip() # e.g. "Ensure '…'"
 
-    # Zero-pad the first segment if <10:
-    # Split at the first dot
-    if "." in section_raw:
-        first_seg, rest = section_raw.split(".", 1)
-        if first_seg.isdigit() and int(first_seg) < 10:
-            first_seg = first_seg.zfill(2)  # e.g. "1" -> "01"
-        section = first_seg + "." + rest
+    # Pad only the first segment to two digits if < 10
+    if len(first_seg) < 2:
+        padded_first = first_seg.zfill(2)  # "1"→"01", "9"→"09"
     else:
-        # No dot present (unlikely), but handle single‐segment sections:
-        if section_raw.isdigit() and int(section_raw) < 10:
-            section = section_raw.zfill(2)
-        else:
-            section = section_raw
+        padded_first = first_seg             # "10" stays "10", "19" stays "19"
 
+    section = padded_first + rest_segments  # e.g. "01" + ".1.7" → "01.1.7"
     return section, level, name
 
 
-def split_reference_for_nist(ref_field: str):
+def extract_nist_each_line(ref_field: str):
     """
-    Given a comma-separated reference string, e.g.:
-      "800-171|3.5.2,800-53|IA-5(1),800-53r5|IA-5(1),CSCv7|16.2,…"
-    Return only the parts that start with "800-53", joined by ", ".
+    Given a comma-separated string of controls, e.g.:
+      "800-171|3.5.2,800-53|IA-5(1),800-53r5|IA-5(1),CSCv7|16.10,…"
+    Return a string where each 800-53* token is on its own line:
+      "800-53|IA-5(1)\n800-53r5|IA-5(1)"
     """
     parts = [p.strip() for p in ref_field.split(",") if p.strip()]
-    nist_only = [p for p in parts if p.startswith("800-53")]
-    return ", ".join(nist_only)
+    nist_list = [p for p in parts if p.startswith("800-53")]
+    return "\n".join(nist_list)
 
 
 def parse_custom_item_block(block_text: str):
     """
-    Given the *inner* text of a <custom_item>…</custom_item> block, parse out
-    keys and their (possibly multiline) quoted values. Extract:
-      - description : "…"
-      - info        : "…"
-      - solution    : "…"
-      - reference   : "…"
-    Then build and return a dict with:
-      Section, Level, Name, Description, Remediation Procedure, NIST
+    Given everything inside <custom_item>…</custom_item>, parse out:
+      - description
+      - info
+      - solution
+      - reference
+    Return dict with:
+      Section, Level, Name,
+      Description (full info),
+      Remediation Procedure (full solution),
+      NIST (800-53 lines)
     """
     data = {}
     lines = block_text.splitlines()
@@ -157,24 +151,19 @@ def parse_custom_item_block(block_text: str):
         key = key_part.strip()
         val = val_part.lstrip()
 
-        # If the value starts with a quote but does NOT end with a quote on this line,
-        # accumulate subsequent lines until we find the closing quote.
+        # If it starts with " but doesn’t end with " → multiline
         if val.startswith('"') and not val.rstrip().endswith('"'):
-            # Remove the opening quote
-            val_accum = val[1:]  # everything after the first "
-            # Accumulate until closing quote
+            val_accum = val[1:]  # drop opening "
             while idx < total:
                 next_line = lines[idx]
                 idx += 1
                 val_accum += "\n" + next_line
                 if next_line.rstrip().endswith('"'):
                     break
-            # Now val_accum ends with a closing quote
             if val_accum.endswith('"'):
                 val_accum = val_accum[:-1]
             data[key] = val_accum.strip()
         else:
-            # Entire value is on this line (possibly quoted or not)
             data[key] = val.strip().strip('"')
 
     desc_field = data.get("description", "")
@@ -183,7 +172,8 @@ def parse_custom_item_block(block_text: str):
     description_text = data.get("info", "")
     remediation_text = data.get("solution", "")
     reference_field = data.get("reference", "")
-    nist_field = split_reference_for_nist(reference_field)
+
+    nist_multiline = extract_nist_each_line(reference_field)
 
     return {
         "Section": section,
@@ -191,12 +181,12 @@ def parse_custom_item_block(block_text: str):
         "Name": name,
         "Description": description_text,
         "Remediation Procedure": remediation_text,
-        "NIST": nist_field
+        "NIST": nist_multiline
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) STEP 3: PARSE ALL MATCHES INTO ROWS
+# 5) PARSE ALL MATCHES INTO ROWS
 # ─────────────────────────────────────────────────────────────────────────────
 
 print("3) Parsing each <custom_item> block into structured rows…")
@@ -206,9 +196,8 @@ for idx, block_inner in enumerate(matches, start=1):
     rows.append(entry)
 print(f"   • Parsed {len(rows)} rows.\n")
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) STEP 4: DUMP TO CSV & EXCEL
+# 6) DUMP TO CSV & EXCEL
 # ─────────────────────────────────────────────────────────────────────────────
 
 print("4) Writing to CSV and Excel…")
@@ -230,4 +219,4 @@ df.to_excel(XLSX_OUTPUT, index=False)
 print(f"   ✔ {CSV_OUTPUT}")
 print(f"   ✔ {XLSX_OUTPUT}\n")
 
-print("✅ All done! You now have a CSV and an Excel file with the six requested columns.")
+print("✅ All done!")
